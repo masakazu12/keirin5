@@ -30,7 +30,10 @@ interface AutoPilotControlBarProps {
   currentRaceNo?: number;
   nextTargetVenue?: string;
   nextTargetRaceNo?: number;
+  nextDeadlineTime?: string;
   teleboatBalance?: number;
+  patrolledCount?: number;
+  totalPatrolQueueCount?: number;
   onOpenBalanceSync?: () => void;
   onToggleAutoPilot: () => void;
   onToggleTargetMode?: () => void;
@@ -51,7 +54,10 @@ export const AutoPilotControlBar: React.FC<AutoPilotControlBarProps> = ({
   currentRaceNo,
   nextTargetVenue,
   nextTargetRaceNo,
+  nextDeadlineTime,
   teleboatBalance,
+  patrolledCount = 0,
+  totalPatrolQueueCount,
   onOpenBalanceSync,
   onToggleAutoPilot,
   onToggleTargetMode,
@@ -138,10 +144,21 @@ export const AutoPilotControlBar: React.FC<AutoPilotControlBarProps> = ({
 
         {/* 巡回先プレビュー（全会場巡回時） */}
         {nextTargetVenue && (
-          <div className="hidden lg:flex items-center gap-1 text-[11px] text-slate-300 bg-slate-900 border border-slate-800 rounded px-2 py-0.5 font-sans">
-            <span className="text-slate-500">巡回先:</span>
+          <div className="hidden lg:flex items-center gap-1.5 text-[11px] text-slate-300 bg-slate-900 border border-slate-800 rounded px-2.5 py-0.5 font-sans">
+            <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-950 text-cyan-300 border border-cyan-800 font-bold">
+              {config.patrolOrder === 'venue_round_robin' ? '会場順' : '〆切早い順'}
+            </span>
+            {patrolledCount > 0 && totalPatrolQueueCount ? (
+              <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-300 border border-emerald-800 font-bold" title="同一レースの複数回巡回を防止中">
+                巡回進捗: {patrolledCount}/{totalPatrolQueueCount} (重複防止)
+              </span>
+            ) : null}
+            <span className="text-slate-500">次回:</span>
             <span className="text-cyan-300 font-bold">
-              {currentVenue} {currentRaceNo ? `${currentRaceNo}R` : ''} ➔ {nextTargetVenue} {nextTargetRaceNo ? `${nextTargetRaceNo}R` : ''}
+              {nextTargetVenue} {nextTargetRaceNo ? `${nextTargetRaceNo}R` : ''}
+              {nextDeadlineTime ? (
+                <span className="text-amber-300 ml-1 font-mono">(締切 {nextDeadlineTime})</span>
+              ) : null}
             </span>
           </div>
         )}

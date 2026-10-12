@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { AutoPilotConfig, AutoPilotLogItem, AutoPilotStage } from '../types/kyotei';
 import { AutoVoteConfig } from '../services/teleboatService';
 import { VENUES } from '../constants/venues';
-import { AUTOPILOT_STAGE_META } from '../services/autopilotService';
+import { AUTOPILOT_STAGE_META, buildPatrolQueue, PatrolRaceItem } from '../services/autopilotService';
 import { ActiveVenueSchedule } from '../services/raceDataProvider';
 import {
   Bot,
@@ -34,6 +34,8 @@ interface AutoPilotModalProps {
   logs: AutoPilotLogItem[];
   teleboatConfig?: AutoVoteConfig;
   activeVenues?: ActiveVenueSchedule[];
+  patrolledKeys?: Set<string>;
+  onResetPatrolledHistory?: () => void;
   onBatchFetchVenues?: () => Promise<void> | void;
   onOpenAutoVoteModal?: () => void;
   onOpenBalanceSync?: () => void;
@@ -49,6 +51,8 @@ export const AutoPilotModal: React.FC<AutoPilotModalProps> = ({
   logs,
   teleboatConfig,
   activeVenues,
+  patrolledKeys,
+  onResetPatrolledHistory,
   onBatchFetchVenues,
   onOpenAutoVoteModal,
   onOpenBalanceSync,
@@ -60,6 +64,18 @@ export const AutoPilotModal: React.FC<AutoPilotModalProps> = ({
   const [activeTab, setActiveTab] = useState<'settings' | 'logs' | 'safety'>('settings');
   const isRunning = config.enabled && stage !== 'STOPPED' && stage !== 'SAFETY_STOP';
   const meta = AUTOPILOT_STAGE_META[stage] || AUTOPILOT_STAGE_META.STOPPED;
+
+  const patrolQueue = useMemo(() => {
+    return buildPatrolQueue({
+      config,
+      availableVenues: activeVenues ? activeVenues.map((v) => v.venueName) : undefined,
+      alreadyVotedKeys: patrolledKeys,
+    });
+  }, [config, activeVenues, patrolledKeys]);
+
+  const patrolledCount = useMemo(() => {
+    return patrolQueue.filter((item) => item.isVoted).length;
+  }, [patrolQueue]);
 
   const logTypeBadge = (type: AutoPilotLogItem['type']) => {
     switch (type) {
@@ -358,6 +374,155 @@ export const AutoPilotModal: React.FC<AutoPilotModalProps> = ({
                       onChange={(e) => onUpdateConfig({ advanceDelaySeconds: Math.max(1, parseInt(e.target.value, 10) || 3) })}
                       className="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-slate-200 font-mono text-xs"
                     />
+                  </div>
+                </div>
+
+                {/* 巡回順序（プライオリティ）の選択 */}
+                <div className="pt-2.5 border-t border-slate-850 space-y-2">
+                  <div className="text-[11px] font-bold text-slate-300 flex items-center justify-between">
+                    <span className="flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5 text-amber-400" />
+                      <span>巡回順序（プライオリティ）</span>
+                    </span>
+                    <span className="text-[10px] text-amber-300 font-normal">
+                      ※ 締切時刻が早いレースから順次投票
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <label
+                      className={`flex items-start gap-2 p-2.5 rounded border cursor-pointer transition-all ${
+                        (config.patrolOrder || 'deadline_asc') === 'deadline_asc'
+                          ? 'bg-amber-950/60 border-amber-500 ring-1 ring-amber-400'
+                          : 'bg-slate-900 border-slate-800 hover:bg-slate-850'
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="patrolOrder"
+                        checked={(config.patrolOrder || 'deadline_asc') === 'deadline_asc'}
+                        onChange={() => onUpdateConfig({ patrolOrder: 'deadline_asc' })}
+                        className="mt-0.5 text-amber-500"
+                      />
+                      <div>
+                        <div className="font-bold text-slate-100 flex items-center gap-1.5">
+                          <span>〆切時刻が早い順 (推奨)</span>
+                          <span className="text-[9px] px-1 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold">
+                            公式時系列
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-slate-400 mt-0.5">
+                          対象会場の全番組を締切時刻が早い順（08:35 ➔ 09:00 ➔ 10:45 ... ➔ 20:45）に時系列巡回します。
+                        </div>
+                      </div>
+                    </label>
+
+                    <label
+                      className={`flex items-start gap-2 p-2.5 rounded border cursor-pointer transition-all ${
+                        config.patrolOrder === 'venue_round_robin'
+                          ? 'bg-blue-950/60 border-blue-500 ring-1 ring-blue-400'
+                          : 'bg-slate-900 border-slate-800 hover:bg-slate-850'
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="patrolOrder"
+                        checked={config.patrolOrder === 'venue_round_robin'}
+                        onChange={() => onUpdateConfig({ patrolOrder: 'venue_round_robin' })}
+                        className="mt-0.5 text-blue-500"
+                      />
+                      <div>
+                        <div className="font-bold text-slate-200">会場順 (ラウンドロビン)</div>
+                        <div className="text-[10px] text-slate-400 mt-0.5">
+                          会場リスト順に1レースずつ交互に切り替えて巡回します。
+                        </div>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+
+                {/* 巡回予定タイムライン（〆切順キュー）プレビュー */}
+                <div className="p-2.5 bg-slate-900/90 rounded border border-slate-800 space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px] flex-wrap gap-1">
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-slate-200 flex items-center gap-1">
+                        <ListOrdered className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>巡回予定スケジュールキュー (全{patrolQueue.length}レース)</span>
+                      </span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-300 border border-emerald-800 font-bold">
+                        進捗: {patrolledCount}/{patrolQueue.length}完了 (重複防止: 有効)
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] text-amber-300 font-mono font-bold">
+                        {(config.patrolOrder || 'deadline_asc') === 'deadline_asc'
+                          ? '★ 〆切時刻 昇順ソート済'
+                          : '会場順ソート'}
+                      </span>
+                      {onResetPatrolledHistory && patrolledCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={onResetPatrolledHistory}
+                          className="text-[10px] px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-cyan-800 rounded transition-colors cursor-pointer flex items-center gap-1 font-bold"
+                          title="巡回履歴をクリアして全レースを最初から再巡回できるようにします"
+                        >
+                          <RotateCcw className="w-2.5 h-2.5" />
+                          <span>巡回履歴リセット</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex gap-1.5 overflow-x-auto pb-1 text-[11px] font-mono">
+                    {patrolQueue.slice(0, 20).map((item, idx) => {
+                      const isFirstUnvoted = !item.isVoted && patrolQueue.findIndex((q) => !q.isVoted) === idx;
+                      return (
+                        <div
+                          key={item.key}
+                          className={`shrink-0 px-2 py-1.5 rounded border flex flex-col items-center min-w-[80px] transition-colors ${
+                            item.isVoted
+                              ? 'bg-emerald-950/40 border-emerald-600/80 text-emerald-200'
+                              : isFirstUnvoted
+                              ? 'bg-amber-950/70 border-amber-500 text-amber-200 ring-1 ring-amber-400 shadow-sm'
+                              : 'bg-slate-950 border-slate-800 text-slate-300'
+                          }`}
+                        >
+                          <span className="text-[9px] text-slate-400 font-sans">
+                            {item.isVoted ? (
+                              <span className="text-emerald-400 font-bold">✓ 巡回済</span>
+                            ) : isFirstUnvoted ? (
+                              <span className="text-amber-300 font-bold">★ 次回</span>
+                            ) : (
+                              `#${idx + 1}`
+                            )}
+                          </span>
+                          <span className="font-bold text-slate-100 font-sans mt-0.5">
+                            {item.venue} {item.raceNo}R
+                          </span>
+                          <span
+                            className={`text-[10px] font-bold font-mono ${
+                              item.isVoted ? 'text-emerald-300 line-through opacity-75' : 'text-amber-300'
+                            }`}
+                          >
+                            {item.deadlineTime}
+                          </span>
+                          <span
+                            className={`text-[8px] px-1 rounded mt-0.5 font-sans ${
+                              item.category === 'モーニング'
+                                ? 'bg-yellow-950 text-yellow-300'
+                                : item.category === 'ナイター'
+                                ? 'bg-indigo-950 text-indigo-300'
+                                : 'bg-blue-950 text-blue-300'
+                            }`}
+                          >
+                            {item.category}
+                          </span>
+                        </div>
+                      );
+                    })}
+                    {patrolQueue.length > 20 && (
+                      <div className="shrink-0 px-2.5 py-1.5 rounded border border-dashed border-slate-800 text-slate-500 flex items-center justify-center text-[10px] font-sans">
+                        ほか {patrolQueue.length - 20}R
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

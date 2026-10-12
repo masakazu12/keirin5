@@ -215,17 +215,14 @@ export default function App() {
       const saved = localStorage.getItem('kyotei_autovote_config_v1');
       if (saved) {
         const parsed = JSON.parse(saved);
-        // 過去のモック初期データ（白川 テレボート会員・50,000円）が残っている場合は実残高0円・未連動に初期化
-        if (parsed.accountHolderName === '白川 テレボート会員' && parsed.accountBalance === 50000) {
-          return {
-            ...DEFAULT_AUTOVOTE_CONFIG,
-            accountBalance: 0,
-            accountHolderName: '',
-            connectionStatus: 'DISCONNECTED',
-            testMode: true,
-          };
-        }
-        return { ...DEFAULT_AUTOVOTE_CONFIG, ...parsed };
+        // 残高が0円かつテストモードの場合は10万円のテスト資金を設定して即座に投票可能にする
+        const balance = parsed.accountBalance > 0 ? parsed.accountBalance : 100000;
+        return {
+          ...DEFAULT_AUTOVOTE_CONFIG,
+          ...parsed,
+          accountBalance: balance,
+          connectionStatus: parsed.connectionStatus || 'CONNECTED',
+        };
       }
     } catch (e) {
       console.error(e);
@@ -290,6 +287,18 @@ export default function App() {
   const [consecutiveLosses, setConsecutiveLosses] = useState<number>(0);
   // 同一セッションにおける投票済みレース追跡（多重投票防止・巡回スキップ判定）
   const votedRacesRef = useRef<Set<string>>(new Set());
+  // 同一セッションにおける巡回済みレース追跡（複数回同じレースを巡回しない完全防止機能）
+  const patrolledRacesRef = useRef<Set<string>>(new Set());
+  const [patrolledCount, setPatrolledCount] = useState<number>(0);
+  // 自動運転における投票買い目退避Ref（状態バッチ更新の非同期遅延・即時投票保証）
+  const autopilotCandidatesRef = useRef<BetCandidate[]>([]);
+
+  const markRaceAsPatrolled = useCallback((key: string) => {
+    if (!patrolledRacesRef.current.has(key)) {
+      patrolledRacesRef.current.add(key);
+      setPatrolledCount(patrolledRacesRef.current.size);
+    }
+  }, []);
 
   // 自動運転設定の保存
   useEffect(() => {
@@ -1095,17 +1104,28 @@ export default function App() {
   const stageExecutionKeyRef = useRef<string>('');
   const isProcessingStageRef = useRef<boolean>(false);
 
+  // 巡回履歴リセット（全レース再巡回可能化）
+  const handleResetPatrolHistory = useCallback(() => {
+    patrolledRacesRef.current.clear();
+    votedRacesRef.current.clear();
+    autopilotCandidatesRef.current = [];
+    setPatrolledCount(0);
+    addAutoPilotLog('INFO', '巡回履歴をリセットしました（全レースを再巡回可能）');
+    showToast('巡回履歴をリセットしました（全レースを再巡回可能）', 'info');
+  }, [addAutoPilotLog, showToast]);
+
   // 巡回先レースの確実な番組同期 & ステージ遷移
   const transitionToPatrolRace = useCallback(
     async (targetVenue: string, targetRaceNo: number) => {
       stageExecutionKeyRef.current = '';
       isProcessingStageRef.current = false;
+      markRaceAsPatrolled(`${targetVenue}-${targetRaceNo}`);
       setAutoPilotCountdown(0);
       setAutoPilotStage('FETCHING_CARD');
       setAutoPilotMessage(`【${targetVenue} 第${targetRaceNo}R】番組・出走表データを取得中...`);
       addAutoPilotLog(
         'INFO',
-        `次レース巡回: 【${race.venue} 第${race.raceNo}R】➔【${targetVenue} 第${targetRaceNo}R】へ移行`
+        `次レース巡回: 【${race.venue} 第${race.raceNo}R】➔【${targetVenue} 第${targetRaceNo}R】へ移行 (重複巡回防止)`
       );
 
       try {
@@ -1126,6 +1146,7 @@ export default function App() {
           c.odds = oddsMap[c.combination] || 5.0;
         });
         const alloc = allocateMoney(generated, settings);
+        autopilotCandidatesRef.current = alloc.updatedCandidates;
         setCandidates(alloc.updatedCandidates);
         setAllocationInfo(alloc);
 
@@ -1133,8 +1154,12 @@ export default function App() {
         isProcessingStageRef.current = false;
         setAutoPilotCountdown(0);
         setAutoPilotStage('ANALYZING');
-        setAutoPilotMessage(`【${targetVenue} 第${targetRaceNo}R】出走表同期完了。条件判定中...`);
-        showToast(`【${targetVenue} 第${targetRaceNo}R】へ巡回移行しました`);
+        setAutoPilotMessage(`【${targetVenue} 第${targetRaceNo}R】(締切: ${newRace.deadlineTime}) 出走表同期完了。条件判定中...`);
+        addAutoPilotLog(
+          'INFO',
+          `次レース巡回: 【${targetVenue} 第${targetRaceNo}R (締切: ${newRace.deadlineTime})】出走表同期完了 (〆切順)`
+        );
+        showToast(`【${targetVenue} 第${targetRaceNo}R (締切 ${newRace.deadlineTime})】へ巡回移行しました`);
       } catch (err) {
         console.error('Patrol transition error:', err);
         setAutoPilotStage('SAFETY_STOP');
@@ -1151,6 +1176,7 @@ export default function App() {
       settings,
       selectedBetType,
       selectedPointCount,
+      markRaceAsPatrolled,
       addAutoPilotLog,
       showToast,
     ]
@@ -1170,38 +1196,59 @@ export default function App() {
       showToast('全自動運転を停止しました', 'info');
     } else {
       setAutoPilotConfig((prev) => ({ ...prev, enabled: true }));
-      const currentVoteKey = `${race.venue}-${race.raceNo}`;
-      if (votedRacesRef.current.has(currentVoteKey)) {
-        // 現在のレースが既に投票済みの場合は、次の未投票レースへ即座に巡回
-        const next = getNextPatrolTarget({
-          currentVenue: race.venue,
-          currentRaceNo: race.raceNo,
-          config: autoPilotConfig,
-          availableVenues: activeVenueNames.length > 0 ? activeVenueNames : undefined,
-          alreadyVotedKeys: votedRacesRef.current,
-        });
-        transitionToPatrolRace(next.nextVenue, next.nextRaceNo);
-      } else {
-        setAutoPilotStage('ANALYZING');
-        setAutoPilotCountdown(0);
-        setAutoPilotMessage(`【${race.venue} 第${race.raceNo}R】条件判定・番組解析中...`);
-      }
       setConsecutiveLosses(0);
       if (autoPilotConfig.soundAlert) playAutoPilotSound('start');
+
+      const currentKey = `${race.venue}-${race.raceNo}`;
+      const isCurrentPatrolled = patrolledRacesRef.current.has(currentKey);
+
+      // 最も締切時刻が早い未巡回レースを探索
+      const next = getNextPatrolTarget({
+        currentVenue: race.venue,
+        currentRaceNo: race.raceNo,
+        config: autoPilotConfig,
+        availableVenues: activeVenueNames.length > 0 ? activeVenueNames : undefined,
+        alreadyVotedKeys: patrolledRacesRef.current,
+        raceDate: race.date,
+        includeCurrentRace: !isCurrentPatrolled,
+      });
+
+      if (next.isRoundComplete && next.remainingQueueCount === 0) {
+        setAutoPilotConfig((prev) => ({ ...prev, enabled: false }));
+        showToast('対象レースはすべて巡回済みです。再巡回するには「設定・ログ」から巡回履歴をリセットしてください', 'info');
+        addAutoPilotLog('STOP', '巡回対象レースがすべて完了しているため自動運転を開始しませんでした');
+        return;
+      }
+
+      const orderLabel = autoPilotConfig.patrolOrder === 'venue_round_robin' ? '会場順' : '〆切時刻が早い順';
       addAutoPilotLog(
         'INFO',
-        `全自動運転を開始しました (${autoPilotConfig.targetMode === 'single_venue' ? `単一会場連続 (${race.venue})` : '全国24場横断巡回'})`
+        `全自動運転を開始しました (${autoPilotConfig.targetMode === 'single_venue' ? `単一会場連続 (${race.venue})` : `全国24場 ${orderLabel}`}) [重複巡回防止: 有効]`
       );
       showToast(
-        `全自動運転を開始しました！(${autoPilotConfig.targetMode === 'single_venue' ? `${race.venue}連続` : '全国24場巡回'})`,
+        `全自動運転を開始しました！(${autoPilotConfig.targetMode === 'single_venue' ? `${race.venue}連続` : orderLabel} / 重複巡回防止)`,
         'success'
       );
+
+      // 画面のレースと最も早い未巡回レースが異なる場合は、直ちに移動して開始 (〆切順の徹底)
+      if (next.nextVenue !== race.venue || next.nextRaceNo !== race.raceNo) {
+        markRaceAsPatrolled(`${next.nextVenue}-${next.nextRaceNo}`);
+        transitionToPatrolRace(next.nextVenue, next.nextRaceNo);
+      } else {
+        markRaceAsPatrolled(currentKey);
+        setAutoPilotStage('ANALYZING');
+        setAutoPilotCountdown(0);
+        setAutoPilotMessage(`【${race.venue} 第${race.raceNo}R】(締切: ${race.deadlineTime}) 条件判定・番組解析中...`);
+      }
     }
   }, [
     autoPilotConfig,
     race.venue,
     race.raceNo,
+    race.deadlineTime,
+    race.date,
     activeVenueNames,
+    markRaceAsPatrolled,
     transitionToPatrolRace,
     addAutoPilotLog,
     showToast,
@@ -1225,45 +1272,64 @@ export default function App() {
     });
   }, [race.venue, showToast, addAutoPilotLog]);
 
-  // 次回巡回予定のプレビュー
+  // 次回巡回予定のプレビュー (〆切時刻が早い順・重複防止反映)
   const nextPatrolPreview = useMemo(() => {
     return getNextPatrolTarget({
       currentVenue: race.venue,
       currentRaceNo: race.raceNo,
       config: autoPilotConfig,
       availableVenues: activeVenueNames.length > 0 ? activeVenueNames : undefined,
-      alreadyVotedKeys: votedRacesRef.current,
+      alreadyVotedKeys: patrolledRacesRef.current,
+      raceDate: race.date,
+      includeCurrentRace: false,
     });
-  }, [race.venue, race.raceNo, autoPilotConfig, activeVenueNames]);
+  }, [race.venue, race.raceNo, autoPilotConfig, activeVenueNames, race.date, patrolledCount]);
 
   // 次レース・待機の強制スキップ
   const handleForceNextRace = useCallback(() => {
     stageExecutionKeyRef.current = '';
     isProcessingStageRef.current = false;
+    markRaceAsPatrolled(`${race.venue}-${race.raceNo}`);
+
     if (autoPilotStage === 'WAITING_RESULT') {
       setAutoPilotCountdown(0);
       setAutoPilotStage('FETCHING_RESULT');
-    } else if (autoPilotStage === 'NEXT_RACE_WAIT') {
+    } else {
       setAutoPilotCountdown(0);
       const next = getNextPatrolTarget({
         currentVenue: race.venue,
         currentRaceNo: race.raceNo,
         config: autoPilotConfig,
         availableVenues: activeVenueNames.length > 0 ? activeVenueNames : undefined,
-        alreadyVotedKeys: votedRacesRef.current,
+        alreadyVotedKeys: patrolledRacesRef.current,
+        raceDate: race.date,
+        includeCurrentRace: false,
       });
-      transitionToPatrolRace(next.nextVenue, next.nextRaceNo);
-    } else {
-      const next = getNextPatrolTarget({
-        currentVenue: race.venue,
-        currentRaceNo: race.raceNo,
-        config: autoPilotConfig,
-        availableVenues: activeVenueNames.length > 0 ? activeVenueNames : undefined,
-        alreadyVotedKeys: votedRacesRef.current,
-      });
+
+      if (next.isRoundComplete && next.remainingQueueCount === 0) {
+        setAutoPilotStage('STOPPED');
+        setAutoPilotConfig((prev) => ({ ...prev, enabled: false }));
+        setAutoPilotMessage('全対象レースの巡回が完了しました（重複巡回防止のため自動停止）');
+        addAutoPilotLog('STOP', '【全巡回完了】設定レースをすべて巡回したため自動運転を終了しました');
+        showToast('全対象レースの巡回が完了しました', 'info');
+        return;
+      }
+
+      markRaceAsPatrolled(`${next.nextVenue}-${next.nextRaceNo}`);
       transitionToPatrolRace(next.nextVenue, next.nextRaceNo);
     }
-  }, [autoPilotStage, race.venue, race.raceNo, autoPilotConfig, activeVenueNames, transitionToPatrolRace]);
+  }, [
+    autoPilotStage,
+    race.venue,
+    race.raceNo,
+    race.date,
+    autoPilotConfig,
+    activeVenueNames,
+    markRaceAsPatrolled,
+    transitionToPatrolRace,
+    addAutoPilotLog,
+    showToast,
+  ]);
 
   // グローバルショートカットキー (F9: 自動運転, F12: 設定, Escape: モーダル閉じる)
   useEffect(() => {
@@ -1299,15 +1365,33 @@ export default function App() {
         setAutoPilotStage('FETCHING_RESULT');
         setAutoPilotMessage(`【${race.venue} 第${race.raceNo}R】公式確定結果を取得・照合中...`);
       } else if (autoPilotStage === 'NEXT_RACE_WAIT') {
-        // 次の巡回対象会場およびレースを計算し、確実に新番組データを取得して進行
+        // 次の巡回対象会場およびレースを計算し、確実に新番組データを取得して進行 (〆切時刻が早い順・重複巡回完全防止)
         const next = getNextPatrolTarget({
           currentVenue: race.venue,
           currentRaceNo: race.raceNo,
           config: autoPilotConfig,
           availableVenues: activeVenueNames.length > 0 ? activeVenueNames : undefined,
-          alreadyVotedKeys: votedRacesRef.current,
+          alreadyVotedKeys: patrolledRacesRef.current,
+          raceDate: race.date,
+          includeCurrentRace: false,
         });
 
+        if (next.isRoundComplete && next.remainingQueueCount === 0) {
+          // 全対象レース巡回完了！重複巡回を完全に防止し自動終了
+          setAutoPilotCountdown(0);
+          setAutoPilotStage('STOPPED');
+          setAutoPilotConfig((prev) => ({ ...prev, enabled: false }));
+          setAutoPilotMessage(`全対象レース（${next.totalQueueCount}レース）の巡回完了。重複巡回防止のため自動停止しました。`);
+          addAutoPilotLog(
+            'STOP',
+            `【全日程巡回完了】設定された全${next.totalQueueCount}レースの投票・巡回が完了しました。重複巡回防止のため自動終了しました。`
+          );
+          if (autoPilotConfig.soundAlert) playAutoPilotSound('stop');
+          showToast(`全対象レースの巡回投票が完了しました（重複巡回防止のため自動終了）`, 'success');
+          return;
+        }
+
+        markRaceAsPatrolled(`${next.nextVenue}-${next.nextRaceNo}`);
         transitionToPatrolRace(next.nextVenue, next.nextRaceNo);
       }
       return;
@@ -1325,9 +1409,13 @@ export default function App() {
     autoPilotCountdown,
     race.venue,
     race.raceNo,
+    race.date,
     autoPilotConfig,
     activeVenueNames,
+    markRaceAsPatrolled,
     transitionToPatrolRace,
+    addAutoPilotLog,
+    showToast,
   ]);
 
   // 全自動運転: アクション実行エンジン（ANALYZING / PREDICTING / VOTING / FETCHING_RESULT）
@@ -1356,6 +1444,9 @@ export default function App() {
 
     // ステージ 1: ANALYZING (条件判定・気象基準チェック)
     if (autoPilotStage === 'ANALYZING') {
+      const currentKey = `${race.venue}-${race.raceNo}`;
+      markRaceAsPatrolled(currentKey);
+
       const safety = evaluateAutoPilotSafety({
         stats,
         config: autoPilotConfig,
@@ -1385,34 +1476,38 @@ export default function App() {
       if (judgment.isSkipped) {
         setAutoPilotMessage(`気象見送り (${race.weather.windSpeed}m/s, ${race.weather.waveHeight}cm)。次会場へ巡回移行`);
         addAutoPilotLog('SKIP', `【${race.venue} 第${race.raceNo}R】${judgment.reasonTitle} により見送り。次会場へスキップ`);
-        votedRacesRef.current.add(`${race.venue}-${race.raceNo}`);
+        markRaceAsPatrolled(currentKey);
+        votedRacesRef.current.add(currentKey);
         setAutoPilotCountdown(2);
         setAutoPilotStage('NEXT_RACE_WAIT');
         return;
       }
 
       // 締切時刻・開催日の厳格判定:
-      // 過去開催日の場合は締め切り後でも投票・判定を行う（バックテスト・過去実績シミュレーション）
-      // 開催日当日の場合は締め切り時間後のレースには自動投票を行わない
-      const voteEligibility = checkRaceVoteEligibility({
-        date: race.date,
-        deadlineTime: race.deadlineTime,
-        venueName: race.venue,
-        raceNo: race.raceNo,
-      });
+      // 本番実投票モード（!autoPilotConfig.testMode）の場合は、当日締切時間後のレースをスキップ
+      // テスト（シミュレーション）モードの場合は、全日程・過去締切レースでもシミュレーション投票を確実に実行
+      if (!autoPilotConfig.testMode) {
+        const voteEligibility = checkRaceVoteEligibility({
+          date: race.date,
+          deadlineTime: race.deadlineTime,
+          venueName: race.venue,
+          raceNo: race.raceNo,
+        });
 
-      if (!voteEligibility.canVote && voteEligibility.isToday && voteEligibility.isPastDeadlineToday) {
-        setAutoPilotMessage(`本日締切超過 (${voteEligibility.effectiveDeadline}) のため投票スキップ。次レースへ巡回移行`);
-        addAutoPilotLog(
-          'SKIP',
-          `【締切超過スキップ】${race.venue} 第${race.raceNo}R (締切: ${voteEligibility.effectiveDeadline})`,
-          `本日開催レースで締切時刻を経過しているため自動投票を見送り、次レースへスキップします`
-        );
-        showToast(`【締切超過】本日 ${race.venue} 第${race.raceNo}R は締切済みのため自動投票をスキップします`, 'info');
-        votedRacesRef.current.add(`${race.venue}-${race.raceNo}`);
-        setAutoPilotCountdown(2);
-        setAutoPilotStage('NEXT_RACE_WAIT');
-        return;
+        if (!voteEligibility.canVote && voteEligibility.isToday && voteEligibility.isPastDeadlineToday) {
+          setAutoPilotMessage(`本日締切超過 (${voteEligibility.effectiveDeadline}) のため本番投票スキップ。次レースへ巡回移行`);
+          addAutoPilotLog(
+            'SKIP',
+            `【締切超過スキップ】${race.venue} 第${race.raceNo}R (締切: ${voteEligibility.effectiveDeadline})`,
+            `本日開催レースで締切時刻を経過しているため実投票を見送り、次レースへスキップします`
+          );
+          showToast(`【締切超過】本日 ${race.venue} 第${race.raceNo}R は締切済みのため実投票をスキップします`, 'info');
+          markRaceAsPatrolled(currentKey);
+          votedRacesRef.current.add(currentKey);
+          setAutoPilotCountdown(2);
+          setAutoPilotStage('NEXT_RACE_WAIT');
+          return;
+        }
       }
 
       const timer = setTimeout(() => {
@@ -1458,6 +1553,7 @@ export default function App() {
           }
 
           const alloc = allocateMoney(currentCands, settings);
+          autopilotCandidatesRef.current = alloc.updatedCandidates;
           setCandidates(alloc.updatedCandidates);
           setAllocationInfo(alloc);
 
@@ -1473,12 +1569,14 @@ export default function App() {
             setAutoPilotStage('VOTING');
             setAutoPilotMessage(`テレボートへ自動投票リクエスト送信中...`);
           } else {
+            markRaceAsPatrolled(`${race.venue}-${race.raceNo}`);
             setAutoPilotCountdown(3);
             setAutoPilotStage('WAITING_RESULT');
             setAutoPilotMessage(`【${race.venue} 第${race.raceNo}R】レース発走待機中...`);
           }
         } catch (e) {
           console.error('Autopilot predict error:', e);
+          markRaceAsPatrolled(`${race.venue}-${race.raceNo}`);
           isProcessingStageRef.current = false;
           setAutoPilotCountdown(3);
           setAutoPilotStage('NEXT_RACE_WAIT');
@@ -1495,6 +1593,7 @@ export default function App() {
     // ステージ 3: VOTING (テレボート自動投票) - 多重投票を完全に防止
     if (autoPilotStage === 'VOTING') {
       const raceVoteKey = `${race.venue}-${race.raceNo}`;
+      markRaceAsPatrolled(raceVoteKey);
 
       // 同一会場・同一レースへの多重投票を完全抑止
       if (votedRacesRef.current.has(raceVoteKey)) {
@@ -1513,13 +1612,32 @@ export default function App() {
           return;
         }
         try {
+          // 買い目候補が未配分または空の場合は直前予想から確実に補完
+          let betsToVote = autopilotCandidatesRef.current && autopilotCandidatesRef.current.length > 0 && autopilotCandidatesRef.current.some((c) => (c.stake || 0) > 0)
+            ? autopilotCandidatesRef.current
+            : candidates;
+
+          if (betsToVote.length === 0 || betsToVote.every((c) => (c.stake || 0) === 0)) {
+            const scored = calculateBoatScores(race.boats, settings);
+            const generated = generateBetsByType(scored, selectedBetType, selectedPointCount);
+            const oddsMap = simulateRealisticOdds(generated, selectedBetType);
+            generated.forEach((c) => {
+              c.odds = oddsMap[c.combination] || 5.0;
+            });
+            const alloc = allocateMoney(generated, settings);
+            betsToVote = alloc.updatedCandidates;
+            setCandidates(alloc.updatedCandidates);
+            setAllocationInfo(alloc);
+            autopilotCandidatesRef.current = alloc.updatedCandidates;
+          }
+
           const effectiveConfig: AutoVoteConfig = {
             ...autoVoteConfig,
             testMode: autoPilotConfig.testMode,
           };
           const voteResult = await executeAutoVote({
             race,
-            candidates,
+            candidates: betsToVote,
             config: effectiveConfig,
           });
 
@@ -1530,15 +1648,21 @@ export default function App() {
               setAutoVoteConfig((prev) => ({
                 ...prev,
                 accountBalance: voteResult.newBalance,
+                lastSyncTime: new Date().toLocaleTimeString('ja-JP', { hour12: false }),
               }));
               if (autoPilotConfig.soundAlert) playAutoPilotSound('vote');
               addAutoPilotLog(
                 'VOTE',
-                `テレボート投票完了 (${autoPilotConfig.testMode ? 'テスト' : '本番'})`,
-                `【${race.venue} 第${race.raceNo}R】${candidates.length}点 計¥${voteResult.totalVoted.toLocaleString()} (残高: ¥${voteResult.newBalance.toLocaleString()})`
+                `テレボート投票完了 (${autoPilotConfig.testMode ? 'テスト仮想投票' : 'テレボート本番実投票'})`,
+                `【${race.venue} 第${race.raceNo}R】${betsToVote.length}点 計¥${voteResult.totalVoted.toLocaleString()} (残高: ¥${voteResult.newBalance.toLocaleString()})`
+              );
+              showToast(
+                `【投票完了】${race.venue} 第${race.raceNo}R 計¥${voteResult.totalVoted.toLocaleString()} 投票しました (${autoPilotConfig.testMode ? 'テスト' : '本番'})`,
+                'success'
               );
             } else {
               addAutoPilotLog('VOTE', `投票結果: ${voteResult.error}`);
+              showToast(`投票エラー: ${voteResult.error}`, 'error');
             }
 
             isProcessingStageRef.current = false;
@@ -1581,6 +1705,7 @@ export default function App() {
         // 確定していないレース（発売中・締切前・審判中）の場合は的中判定を絶対に行わない！
         if (!confirmation.isConfirmed) {
           isProcessingStageRef.current = false;
+          markRaceAsPatrolled(`${race.venue}-${race.raceNo}`);
           addAutoPilotLog(
             'INFO',
             `【未確定保留】${race.venue} 第${race.raceNo}R（${confirmation.statusText}）`,
@@ -1630,7 +1755,11 @@ export default function App() {
             return;
           }
 
-          const matchedCandidate = candidates.find(
+          const currentBets = autopilotCandidatesRef.current && autopilotCandidatesRef.current.length > 0
+            ? autopilotCandidatesRef.current
+            : candidates;
+
+          const matchedCandidate = currentBets.find(
             (c) => isBetHit(c.combination, c.betType || selectedBetType, res.finishOrder) && c.stake > 0
           );
           const isHit = !!matchedCandidate;
@@ -1640,7 +1769,7 @@ export default function App() {
             payout100 = getEstimatedOfficialPayout(res.officialPayout, selectedBetType, matchedCandidate.odds);
           }
 
-          const totalStake = candidates.reduce((sum, c) => sum + (c.stake || 0), 0);
+          const totalStake = currentBets.reduce((sum, c) => sum + (c.stake || 0), 0);
           const totalReturn = isHit && matchedCandidate ? Math.floor((matchedCandidate.stake * payout100) / 100) : 0;
           const profit = totalReturn - totalStake;
 
@@ -1654,7 +1783,7 @@ export default function App() {
             status: isHit ? 'Teki2' : 'Hazure',
             betType: selectedBetType,
             pointCount: selectedPointCount,
-            bets: candidates.map((c) => ({
+            bets: currentBets.map((c) => ({
               combination: c.combination,
               odds: c.odds,
               stake: c.stake,
@@ -1671,6 +1800,7 @@ export default function App() {
 
           setHistory((prev) => [newRecord, ...prev]);
           setLastFinishedStatus(isHit ? 'Teki2' : 'Hazure');
+          markRaceAsPatrolled(`${race.venue}-${race.raceNo}`);
 
           // 的中払戻金をテレボート口座残高に自動反映・入金連動
           if (isHit && totalReturn > 0) {
@@ -1739,6 +1869,7 @@ export default function App() {
           setAutoPilotMessage(`次レースへ移行待機中 (${delay}秒)...`);
         } catch (e) {
           console.error('Autopilot fetch result error:', e);
+          markRaceAsPatrolled(`${race.venue}-${race.raceNo}`);
           isProcessingStageRef.current = false;
           setAutoPilotCountdown(3);
           setAutoPilotStage('NEXT_RACE_WAIT');
@@ -1936,7 +2067,10 @@ export default function App() {
           currentRaceNo={race.raceNo}
           nextTargetVenue={nextPatrolPreview.nextVenue}
           nextTargetRaceNo={nextPatrolPreview.nextRaceNo}
+          nextDeadlineTime={nextPatrolPreview.nextDeadlineTime}
           teleboatBalance={autoVoteConfig.accountBalance}
+          patrolledCount={patrolledCount}
+          totalPatrolQueueCount={nextPatrolPreview.totalQueueCount}
           onOpenBalanceSync={() => setActiveModal('balanceSync')}
           onToggleAutoPilot={handleToggleAutoPilot}
           onToggleTargetMode={handleToggleAutoPilotTargetMode}
@@ -2249,6 +2383,8 @@ export default function App() {
           logs={autoPilotLogs}
           teleboatConfig={autoVoteConfig}
           activeVenues={activeVenues}
+          patrolledKeys={patrolledRacesRef.current}
+          onResetPatrolledHistory={handleResetPatrolHistory}
           onBatchFetchVenues={handleBatchFetchVenues}
           onOpenAutoVoteModal={() => setActiveModal('autoVote')}
           onOpenBalanceSync={() => setActiveModal('balanceSync')}

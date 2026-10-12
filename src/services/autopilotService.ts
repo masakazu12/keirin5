@@ -4,6 +4,7 @@
  */
 
 import { AutoPilotConfig, AutoPilotStage, AutoPilotLogItem, DayStatistics } from '../types/kyotei';
+import { getStandardDeadlineTime } from './deadlineService';
 
 export interface StageMeta {
   stage: AutoPilotStage;
@@ -224,9 +225,119 @@ export const ALL_24_VENUES: string[] = [
 
 export const DEFAULT_PATROL_VENUES: string[] = ALL_24_VENUES;
 
+export interface PatrolRaceItem {
+  venue: string;
+  raceNo: number;
+  deadlineTime: string;
+  deadlineMinutes: number;
+  category: 'モーニング' | 'デイ' | 'ナイター';
+  key: string;
+  isVoted: boolean;
+}
+
+export interface NextPatrolTargetResult {
+  nextVenue: string;
+  nextRaceNo: number;
+  nextDeadlineTime: string;
+  isRoundComplete: boolean;
+  queueIndex?: number;
+  totalQueueCount: number;
+  completedQueueCount: number;
+  remainingQueueCount: number;
+  isRepeatPrevented?: boolean;
+  candidate?: PatrolRaceItem;
+}
+
 /**
- * 次の巡回対象レースおよび会場を決定（全会場巡回 vs 単一会場連続）
- * すでに投票済みの会場・レースを自動検知して別会場へスキップし、多重投票を完全抑止
+ * 巡回対象全レースのスケジュールキューを構築
+ * 〆切時刻が早い順 (deadline_asc) または 会場順 (venue_round_robin) にソート
+ */
+export function buildPatrolQueue(params: {
+  config: AutoPilotConfig;
+  availableVenues?: string[];
+  alreadyVotedKeys?: Set<string>;
+  currentVenue?: string;
+}): PatrolRaceItem[] {
+  const { config, availableVenues, alreadyVotedKeys, currentVenue } = params;
+
+  // 1. 会場プールの決定
+  let venuePool: string[] = [];
+  if (config.targetMode === 'single_venue') {
+    venuePool = [currentVenue || '住之江'];
+  } else {
+    venuePool =
+      config.targetVenues && config.targetVenues.length > 0
+        ? config.targetVenues
+        : availableVenues && availableVenues.length > 0
+        ? availableVenues
+        : ALL_24_VENUES;
+  }
+
+  const startR = Math.min(12, Math.max(1, config.startRaceNo || 1));
+  const endR = Math.min(12, Math.max(startR, config.endRaceNo || 12));
+
+  const toMinutes = (timeStr: string): number => {
+    if (!timeStr || !timeStr.includes(':')) return 720;
+    const [h, m] = timeStr.split(':').map((s) => parseInt(s, 10));
+    return (h || 0) * 60 + (m || 0);
+  };
+
+  const getCategory = (v: string): 'モーニング' | 'デイ' | 'ナイター' => {
+    if (['鳴門', '徳山', '芦屋', '唐津', '三国'].includes(v)) return 'モーニング';
+    if (['桐生', '蒲郡', '住之江', '丸亀', '下関', '若松', '大村'].includes(v)) return 'ナイター';
+    return 'デイ';
+  };
+
+  const items: PatrolRaceItem[] = [];
+
+  for (const venue of venuePool) {
+    for (let r = startR; r <= endR; r++) {
+      const deadline = getStandardDeadlineTime(venue, r);
+      const key = `${venue}-${r}`;
+      items.push({
+        venue,
+        raceNo: r,
+        deadlineTime: deadline,
+        deadlineMinutes: toMinutes(deadline),
+        category: getCategory(venue),
+        key,
+        isVoted: alreadyVotedKeys ? alreadyVotedKeys.has(key) : false,
+      });
+    }
+  }
+
+  // 2. ソート順序の決定 (既定: 〆切時刻が早い順)
+  const patrolOrder = config.patrolOrder || 'deadline_asc';
+
+  if (patrolOrder === 'deadline_asc') {
+    // 〆切時刻が早い順（08:35 -> 09:00 -> 10:45 ... -> 20:45）に昇順ソート
+    items.sort((a, b) => {
+      if (a.deadlineMinutes !== b.deadlineMinutes) {
+        return a.deadlineMinutes - b.deadlineMinutes;
+      }
+      if (a.raceNo !== b.raceNo) {
+        return a.raceNo - b.raceNo;
+      }
+      return a.venue.localeCompare(b.venue, 'ja');
+    });
+  } else {
+    // 会場順 (ラウンドロビン)
+    items.sort((a, b) => {
+      if (a.raceNo !== b.raceNo) {
+        return a.raceNo - b.raceNo;
+      }
+      return venuePool.indexOf(a.venue) - venuePool.indexOf(b.venue);
+    });
+  }
+
+  return items;
+}
+
+/**
+ * 次の巡回対象レースおよび会場を決定
+ * 1. 〆切時刻が早い順 (deadline_asc) で常にソート・巡回
+ * 2. 同一レースの重複巡回・多重投票を完全抑止（すでに巡回済みのレースは絶対に再訪しない）
+ * 3. 全対象レースを巡回し終えたら isRoundComplete: true かつ remainingQueueCount: 0 を返し、先頭ループを防止して停止
  */
 export function getNextPatrolTarget(params: {
   currentVenue: string;
@@ -234,75 +345,122 @@ export function getNextPatrolTarget(params: {
   config: AutoPilotConfig;
   availableVenues?: string[];
   alreadyVotedKeys?: Set<string>;
-}): { nextVenue: string; nextRaceNo: number; isRoundComplete: boolean } {
-  const { currentVenue, currentRaceNo, config, availableVenues, alreadyVotedKeys } = params;
+  raceDate?: string;
+  includeCurrentRace?: boolean;
+}): NextPatrolTargetResult {
+  const {
+    currentVenue,
+    currentRaceNo,
+    config,
+    availableVenues,
+    alreadyVotedKeys,
+    raceDate,
+    includeCurrentRace = false,
+  } = params;
 
-  // 1. 単一会場 連続運転モード (1R ➔ 12R)
-  if (config.targetMode === 'single_venue') {
-    const startR = config.startRaceNo || 1;
-    const endR = config.endRaceNo || 12;
-    let nextRaceNo = currentRaceNo < endR ? currentRaceNo + 1 : startR;
-    let isRoundComplete = currentRaceNo >= endR;
+  // 1. 巡回対象の全レースキューを構築（〆切時刻昇順にソート）
+  const queue = buildPatrolQueue({
+    config,
+    availableVenues,
+    alreadyVotedKeys,
+    currentVenue,
+  });
 
-    if (alreadyVotedKeys) {
-      let attempts = 0;
-      while (alreadyVotedKeys.has(`${currentVenue}-${nextRaceNo}`) && attempts < 12) {
-        nextRaceNo = nextRaceNo < endR ? nextRaceNo + 1 : startR;
-        if (nextRaceNo === startR) isRoundComplete = true;
-        attempts++;
-      }
-    }
+  const currentKey = `${currentVenue}-${currentRaceNo}`;
 
+  if (queue.length === 0) {
+    const fallbackDeadline = getStandardDeadlineTime(currentVenue, currentRaceNo);
     return {
       nextVenue: currentVenue,
-      nextRaceNo,
-      isRoundComplete,
+      nextRaceNo: currentRaceNo,
+      nextDeadlineTime: fallbackDeadline,
+      isRoundComplete: true,
+      totalQueueCount: 0,
+      completedQueueCount: 0,
+      remainingQueueCount: 0,
     };
   }
 
-  // 2. 全国24場横断 巡回モード (全会場を1レースごとに切り替えて巡回)
-  const venuePool =
-    config.targetVenues && config.targetVenues.length > 0
-      ? config.targetVenues
-      : availableVenues && availableVenues.length > 0
-      ? availableVenues
-      : ALL_24_VENUES;
+  // 2. 未巡回レース（重複防止）の抽出
+  // alreadyVotedKeys に含まれているレースは絶対に除外！
+  // また次レース探索時は、現在レース自身も除外！
+  const unpatrolledQueue = queue.filter((item) => {
+    if (alreadyVotedKeys && alreadyVotedKeys.has(item.key)) {
+      return false;
+    }
+    if (!includeCurrentRace && item.key === currentKey) {
+      return false;
+    }
+    return true;
+  });
 
-  const currentIdx = venuePool.indexOf(currentVenue);
-  // 現在会場の次にある会場を選択（見つからない場合は先頭会場）
-  let nextIdx = currentIdx >= 0 ? (currentIdx + 1) % venuePool.length : 0;
-  let nextVenue = venuePool[nextIdx];
+  const completedCount = queue.length - unpatrolledQueue.length;
 
-  // 全会場を1巡した場合はレース番号を進める
-  let isRoundComplete = nextIdx === 0;
-  let nextRaceNo = currentRaceNo;
-
-  if (isRoundComplete) {
-    const startR = config.startRaceNo || 1;
-    const endR = config.endRaceNo || 12;
-    nextRaceNo = currentRaceNo < endR ? currentRaceNo + 1 : startR;
+  // 3. 全レースの巡回がすでに完了している場合（未巡回ゼロ）
+  // ★重要: 先頭レースへループバックせず、isRoundComplete: true で正常終了させる（重複巡回完全防止）
+  if (unpatrolledQueue.length === 0) {
+    return {
+      nextVenue: currentVenue,
+      nextRaceNo: currentRaceNo,
+      nextDeadlineTime: getStandardDeadlineTime(currentVenue, currentRaceNo),
+      isRoundComplete: true,
+      queueIndex: -1,
+      totalQueueCount: queue.length,
+      completedQueueCount: queue.length,
+      remainingQueueCount: 0,
+      isRepeatPrevented: true,
+    };
   }
 
-  // 既に投票済みの組み合わせはスキップして次の未投票会場・レースを探す
-  if (alreadyVotedKeys && alreadyVotedKeys.size > 0) {
-    let attempts = 0;
-    const maxAttempts = venuePool.length * 12;
-    while (alreadyVotedKeys.has(`${nextVenue}-${nextRaceNo}`) && attempts < maxAttempts) {
-      nextIdx = (nextIdx + 1) % venuePool.length;
-      nextVenue = venuePool[nextIdx];
-      if (nextIdx === 0) {
-        const startR = config.startRaceNo || 1;
-        const endR = config.endRaceNo || 12;
-        nextRaceNo = nextRaceNo < endR ? nextRaceNo + 1 : startR;
-        isRoundComplete = true;
-      }
-      attempts++;
+  // 4. 本日開催の場合の締切時刻判定
+  const now = new Date();
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const isToday = !raceDate || raceDate === todayStr;
+  const currentMinutesToday = now.getHours() * 60 + now.getMinutes();
+
+  const patrolOrder = config.patrolOrder || 'deadline_asc';
+
+  let selectedCandidate: PatrolRaceItem | undefined;
+
+  if (patrolOrder === 'deadline_asc') {
+    // 〆切時刻が早い順 (deadline_asc) の場合:
+    // unpatrolledQueue は既に deadlineMinutes 昇順（08:35 -> 09:00 -> ...）に完全ソートされている。
+    // 本番実投票モード（!config.testMode）の場合のみ、締切前（現在時刻以降または直近3分前以内）のレースを優先。
+    // テスト投票（シミュレーション）モードまたは指定時は、未巡回キューの先頭（最も〆切時刻が早いレース）から順次確実に巡回。
+    if (!config.testMode && isToday) {
+      selectedCandidate = unpatrolledQueue.find(
+        (item) => item.deadlineMinutes >= currentMinutesToday - 3
+      );
+    }
+
+    if (!selectedCandidate) {
+      selectedCandidate = unpatrolledQueue[0];
+    }
+  } else {
+    // 会場順 (ラウンドロビン) の場合
+    const currentQueueIdx = queue.findIndex((item) => item.key === currentKey);
+    if (currentQueueIdx >= 0) {
+      selectedCandidate = unpatrolledQueue.find(
+        (item) => queue.indexOf(item) > currentQueueIdx
+      );
+    }
+    if (!selectedCandidate) {
+      selectedCandidate = unpatrolledQueue[0];
     }
   }
 
+  const finalTarget = selectedCandidate || unpatrolledQueue[0];
+  const targetIdx = queue.findIndex((item) => item.key === finalTarget.key);
+
   return {
-    nextVenue,
-    nextRaceNo,
-    isRoundComplete,
+    nextVenue: finalTarget.venue,
+    nextRaceNo: finalTarget.raceNo,
+    nextDeadlineTime: finalTarget.deadlineTime,
+    isRoundComplete: false,
+    queueIndex: targetIdx,
+    totalQueueCount: queue.length,
+    completedQueueCount: completedCount,
+    remainingQueueCount: unpatrolledQueue.length,
+    candidate: finalTarget,
   };
 }

@@ -154,6 +154,23 @@ export const HelpModal: React.FC<HelpModalProps> = ({ onClose }) => {
             </ul>
           </div>
 
+          {/* 6. 全自動運転 (Autopilot) & 〆切時刻が早い順巡回仕様 */}
+          <div className="space-y-1.5">
+            <h4 className="font-bold text-cyan-400 border-b border-slate-800 pb-1 flex items-center gap-1">
+              <CheckCircle className="w-3.5 h-3.5" />
+              <span>6. 全自動運転 (Autopilot) & 〆切時刻が早い順 巡回仕様</span>
+            </h4>
+            <p className="text-slate-300">
+              番組データ取得・気象判定・予想生成・オッズ資金配分・自動投票・結果取得の全サイクルを自動で循環実行するシステムです。
+            </p>
+            <ul className="list-disc list-inside space-y-1 text-slate-300 pl-1">
+              <li><strong className="text-white">〆切時刻が早い順巡回：</strong>全国の対象会場（モーニング 08:35〜、デイ 10:45〜、ナイター 15:15〜20:45）の全番組を締切時刻が早い順に時系列ソートして巡回投票します。</li>
+              <li><strong className="text-white">多重投票抑止：</strong>投票済みのレースは自動記憶され、同一レースへの二重投票を完全防止して次の未投票レースへ自動スキップします。</li>
+              <li><strong className="text-white">未確定保留ガード：</strong>発売中・審判中のレースは確定着順が出るまで的中判定を保留し、フライング誤判定を防止します。</li>
+              <li><strong className="text-white">セーフティ安全装置：</strong>目標利益到達・許容損失到達・連続不的中リミットで作動し、自動停止します。</li>
+            </ul>
+          </div>
+
           {/* 7. 多券種・購入点数選択機能 */}
           <div className="space-y-1.5">
             <h4 className="font-bold text-cyan-400 border-b border-slate-800 pb-1 flex items-center gap-1">

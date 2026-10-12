@@ -78,7 +78,7 @@ const RACER_POOL: { name: string; reg: string; branch: string; grade: BoatGrade;
  */
 export function getStandardDeadlineTime(venueName: string, raceNo: number): string {
   const nighterVenues = ['桐生', '蒲郡', '住之江', '丸亀', '下関', '若松', '大村'];
-  const morningVenues = ['鳴門', '芦屋', '唐津', '徳山'];
+  const morningVenues = ['鳴門', '芦屋', '唐津', '徳山', '三国'];
 
   const rIndex = Math.min(Math.max(raceNo - 1, 0), 11);
 

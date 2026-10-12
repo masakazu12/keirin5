@@ -190,9 +190,12 @@ export interface AutoPilotLogItem {
   details?: string;
 }
 
+export type PatrolOrderMode = 'deadline_asc' | 'venue_round_robin';
+
 export interface AutoPilotConfig {
   enabled: boolean;                 // 自動運転稼働フラグ
   targetMode: 'single_venue' | 'all_venues'; // 単一場1〜12R連続 | 全場横断巡回
+  patrolOrder?: PatrolOrderMode;    // 巡回順序 (deadline_asc: 〆切時刻が早い順 [推奨・既定] | venue_round_robin: 会場順)
   targetVenues: string[];           // 対象会場（空配列なら全場）
   startRaceNo: number;              // 開始レース番号 (1〜12)
   endRaceNo: number;                // 終了レース番号 (1〜12)
@@ -210,6 +213,7 @@ export interface AutoPilotConfig {
 export const DEFAULT_AUTOPILOT_CONFIG: AutoPilotConfig = {
   enabled: false,
   targetMode: 'all_venues',
+  patrolOrder: 'deadline_asc',
   targetVenues: [],
   startRaceNo: 1,
   endRaceNo: 12,
